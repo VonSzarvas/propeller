@@ -1,0 +1,651 @@
+CON 'Rev.1r:  HyperRam VGA test with Evalboard Rev.A and Parallax HyperRam board
+    'MIT License
+    'Raymond Allen 2019
+    'Technology test:  Using HyperRam as VGA screen buffer for Propeller 2
+    'This one is a single 640 pixel read, no tearing, perfect alignment.
+    'Now using COGATN to syncronize HyperRam with VGA
+    'Now using SmartPin to clock HyperRam
+    'VGA is on pins P0..P4
+    'HyperRam is on pins P32..P43
+    'Changed from waitse1 to fixed waitx so data is in correct spot in memory.  Adjust write latency to match.
+	'Reference : http://forums.parallax.com/discussion/comment/1481729/#Comment_1481729
+
+'******************************
+'*  VGA 640 x 480 x 8bpp-lut  *
+'******************************
+CON 'HyperRam pin settings, moved to P32 (make sure to change ina->inb, etc)
+        Messages=$1000 'storage for string messages
+        Pin_RSTn=15+32'11+32
+        Pin_CSn=12+32'10+32
+        Pin_CK=8+32
+        Pin_RWDS=10+32'9+32     
+        'Data on P32..P39   'If moved back to P0..P7, change dirb to dira in lines like this:  setbyte   dirb,#$FF,#0
+        
+CON  'RJA:  new for real P2 - you can use different xdiv and xmul to set clock frequency:  /10*125 -> 250 MHz
+  _XTALFREQ     = 20_000_000                                    ' crystal frequency
+  _XDIV         = 2                                            ' crystal divider to give 1MHz
+  _XMUL         = 25                                          ' crystal / div * mul
+  _XDIVP        = 1                                             ' crystal / div * mul /divp to give _CLKFREQ (1,2,4..30)
+  _XOSC         = %10                                  'OSC    ' %00=OFF, %01=OSC, %10=15pF, %11=30pF
+  _XSEL         = %11                                   'XI+PLL ' %00=rcfast(20+MHz), %01=rcslow(~20KHz), %10=XI(5ms), %11=XI+PLL(10ms)
+  _XPPPP        = ((_XDIVP>>1) + 15) & $F                       ' 1->15, 2->0, 4->1, 6->2...30->14
+  _CLOCKFREQ    = _XTALFREQ / _XDIV * _XMUL / _XDIVP            ' internal clock frequency                
+  _SETFREQ      = 1<<24 + (_XDIV-1)<<18 + (_XMUL-1)<<8 + _XPPPP<<4 + _XOSC<<2  ' %0000_000e_dddddd_mmmmmmmmmm_pppp_cc_00  ' setup  oscillator
+  _ENAFREQ      = _SETFREQ + _XSEL                                             ' %0000_000e_dddddd_mmmmmmmmmm_pppp_cc_ss  ' enable oscillator
+  
+CON
+
+  intensity = 80    '0..128
+
+  fclk      = _CLOCKFREQ 'RJA:  Adjusted for real P2 '80_000_000.0
+  fpix      = 25_000_000.0
+  fset      = (fpix / fclk * 2.0) * float($4000_0000)
+
+  vsync     =   4   'vsync pin 'RJA:  changed for real P2
+
+
+CON  'Cog assignments
+        Serial_Cog=3
+        HyperRam_Cog=2
+        VGA_Cog=0 
+
+CON   'Location of source image data (palette is just before this)
+        BitmapData = $8000
+
+DAT 'Start of HyperRAM test code
+orgh  0
+org   0
+'+-------[ Set Xtal ]----------------------------------------------------------+ 
+' RJA:  New for real P2
+                hubset  #0                              ' set 20MHz+ mode
+                hubset  ##_SETFREQ                      ' setup oscillator
+                waitx   ##20_000_000/100                ' ~10ms
+                hubset  ##_ENAFREQ                      ' enable oscillator
+'+-----------------------------------------------------------------------------+        
+                coginit   #Serial_Cog,##@SerialStart
+                coginit   #HyperRam_Cog,##@HyperInit
+                coginit   #VGA_Cog,##@VGA_Driver 'this one has to be last as overwrites this cog
+endStart
+                jmp #endStart
+
+DAT 'HyperInit
+org 0
+HyperInit              
+                drvh      #Pin_RSTn  'Needed for Parallax board
+                mov       x2,#10
+Starting
+                mov       y2,#1
+
+'Load bmp from hub into HyperRam              
+                mov       SourceAdd,##BitmapData
+                mov       HyperRow,#0
+                mov       k2,#480
+WriteBmpLoop              
+              
+                call      #WriteRamBurstSub
+                add       SourceAdd,##640
+                add       HyperRow,#1
+                waitx     ##20
+                djnz      k2,#WriteBmpLoop
+              
+              
+                waitx     ##1000 
+
+DAT 'Output from HyperRam              
+                       
+'Wait for VSYNC (normally low)
+WaitVSyncHigh        
+                testp     #vsync wz
+        if_nz   jmp     #WaitVSyncHigh 'wait for vsync high
+WaitVSyncLow
+                testp     #vsync wz
+        if_z    jmp     #WaitVSyncLow 'wait for vsync low
+                            
+                mov      HyperRow,#0                           
+ReadBmpLoop1    'preload the first line
+                waitatn       
+                call      #ReadRamBurstSub
+
+            
+'Wait for HSYNC
+WaitHSyncLow
+                waitatn
+                mov      y2,#0                
+ReadBmpLoop2         
+                call      #ReadRamBurstSub  'read next line
+             
+HyperWait                      
+                add       HyperRow,#1
+                cmp       HyperRow,#480 wz
+        if_z    mov       HyperRow,#0
+        if_z    jmp       #WaitVSyncHigh
+                mov       y2,#0
+                jmp       #WaitHSyncLow      
+              
+                call      #ShowData
+              
+done
+                jmp       #done              
+
+dat 'WriteRamBurstSub:  write burst
+WriteRamBurstSub              
+                drvh      #Pin_CSn
+                drvl      #Pin_CK
+                flth      #Pin_RWDS
+
+              'set address
+                mov       HyperAddress,HyperRow  'row# 
+                shl      HyperAddress,#7 '1024 byte row address with A10 in MSBit for lowest byte
+              '25 bits of address will span
+                and       HyperAddress,##$1F_FF_FF_FF  'clear CA47..45
+                or        HyperAddress,##$20_00_00_00 'set CA47..45 for linear write memory
+
+
+              'Read Register#0
+              'Send Command Address
+              'setbyte   dira,#$FF,#0
+                setbyte   dirb,#$FF,#0
+                outl      #Pin_CSn'andn      outa,mCSn 'bring cs low  
+              'Write CA
+              '47=Read/nWrite, 46=Register/nMemory, 45=linear/nWrapped, 44..16=A31..A3 , 2..0=A2..A0  
+                rol       HyperAddress,#8        
+                setbyte   outb,HyperAddress,#0    'CA47..40  'lower 5 bits are A31..A27
+                outnot    #Pin_CK
+                rol       HyperAddress,#8            
+                setbyte   outb,HyperAddress,#0      'CA39..32  'A26..A19
+                outnot    #Pin_CK            
+                rol       HyperAddress,#8 
+                setbyte   outb,HyperAddress,#0      'CA31..24   'A18..A11
+                outnot    #Pin_CK         
+                rol       HyperAddress,#8    
+                setbyte   outb,HyperAddress,#0      'CA23..16   'A10..A3
+                outnot    #Pin_CK           
+                setbyte   outb,#0,#0      'CA15..8
+                outnot    #Pin_CK                           
+                setbyte   outb,#0,#0      'CA7..0  'lower 3 bits are A2..A0
+                outnot    #Pin_CK
+
+
+              'Latency Clocks
+                nop
+                mov       i2,#22'27'24  'need to check that this is right...
+LoopLat1
+                outnot    #Pin_CK
+                djnz      i2,#LoopLat1
+             
+                drvl      #Pin_RWDS
+
+              'prepare to load buffer              
+                mov         i2,SourceAdd
+                mov         y2,##640
+writeloop
+                rdbyte  x2,i2
+                add     i2,#1
+                setbyte   outb,x2,#0
+                outnot  #Pin_CK
+                djnz    y2,#writeloop
+              
+             'Finish
+                setbyte   dirb,#$00,#0
+                outl      #Pin_CK
+                outh      #Pin_CSn
+                RET
+
+dat 'ReadRamBurstSub:  read burst
+ReadRamBurstSub              
+              drvh      #Pin_CSn
+              drvl      #Pin_CK
+              dirl      #Pin_RWDS
+
+              'set address
+              mov       HyperAddress,HyperRow  'row# 
+              mov       x2,y2
+              shl       x2,#2
+
+              shl      HyperAddress,#7 '1024 byte row address with A10 in MSBit for lowest byte
+              add      HyperAddress,x2 
+              '25 bits of address will span
+              and       HyperAddress,##$1F_FF_FF_FF  'clear CA47..45
+              or        HyperAddress,##$A0_00_00_00 'set CA47..45 for linear read from memory
+
+              'Read Register#0
+              'Send Command Address
+              setbyte   dirb,#$FF,#0
+              outl      #Pin_CSn'andn      outa,mCSn 'bring cs low                
+      
+              'Write CA
+              '47=Read/nWrite, 46=Register/nMemory, 45=linear/nWrapped, 44..16=A31..A3 , 2..0=A2..A0  
+              rol       HyperAddress,#8        
+              setbyte   outb,HyperAddress,#0    'CA47..40  'lower 5 bits are A31..A27
+              outnot    #Pin_CK
+              nop
+              rol       HyperAddress,#8            
+              setbyte   outb,HyperAddress,#0      'CA39..32  'A26..A19
+              outnot    #Pin_CK            
+              nop
+              rol       HyperAddress,#8 
+              setbyte   outb,HyperAddress,#0      'CA31..24   'A18..A11
+              outnot    #Pin_CK         
+              nop
+              rol       HyperAddress,#8    
+              setbyte   outb,HyperAddress,#0      'CA23..16   'A10..A3
+              outnot    #Pin_CK           
+              nop
+              setbyte   outb,#0,#0      'CA15..8
+              outnot    #Pin_CK                           
+              nop
+              setbyte   outb,#0,#0      'CA7..0  'lower 3 bits are A2..A0
+              outnot    #Pin_CK
+              
+              setbyte   dirb,#$00,#0 'release control of buffer             
+
+              'prepare to load buffer using fifo              
+              loc       ptra,#@HyperBuffer
+              mov       x2,y2
+              mul       x2,#64
+              add       ptra,x2
+              wrfast    #0,ptra            
+              
+              'configure smartpin to run HR clock
+              dirl      #Pin_CK
+              wrpin     #%1_00110_0,#Pin_CK
+              wxpin     #1,#Pin_CK  'add on every clock
+              mov       pa,#1
+              shl       pa,#30 '250/4 = 62.5 MHz
+              wypin     pa,#Pin_CK
+              dirh      #Pin_CK
+                       
+
+              
+               
+              'Wait for Pin_RWDS to go high and then low
+              'setse1    #$80+Pin_RWDS
+              'waitse1  
+              waitx     #50'49'38   'changed from 49 to 50 for Rev.B  'works at 38 at 250 MHz
+              
+              'read in bytes
+              rep   #1,##640 
+              wfbyte    inb            
+.reploop2      
+
+
+
+             'Finish
+              dirl      #Pin_CK     'turn off smartpin
+              wrpin     #0,#Pin_CK  'disable smartpin
+              outl      #Pin_CK     'make sure clock is low
+              dirh      #Pin_CK 
+              outh      #Pin_CSn    'End of transaction
+              RET
+                    
+           
+DAT 'showdata              
+showdata
+              loc       ptra,#@HyperBuffer
+              rdfast    #0,ptra
+              
+              'Show Data
+              mov       x2,#10
+OutLoop              
+              mov       tx_out,#13
+              call      #OutputCharSub
+              rfbyte    tx_out
+              call      #OutputByteSub  
+              djnz      x2,#OutLoop    
+              ret            
+
+              
+
+
+DAT 'ClockHelperSub
+ClockHelperSub   '
+              wrbyte    #5,tx_target 'send command #5
+              ret
+
+DAT 'variables
+tx_target     long      Mailbox1  'Mailbox for serial output
+tx_hexTarget  long      Mailbox2  'Mailbox for Hex output
+tx_out        long      0   'holds character to output
+tx_cnt        long      0
+x2             long      0
+y2             long      0
+i2             long      0
+j2             long      0
+k2             long      0
+timer1         long      0
+flag2         long      0
+mRSTn         long      1<<Pin_RSTn
+mCSn          long      1<<Pin_CSn
+mCK           long      1<<Pin_CK
+mRWDS         long      1<<Pin_RWDS
+DataIn0        long      0
+HyperAddress  long      0
+VgaCols      long       640
+SourceAdd    long       0
+HyperRow      long       0
+
+
+
+
+
+
+
+DAT 'OutputCharSub
+OutputCharSub   'Output character in tx_out
+              wrbyte    tx_out,tx_hexTarget 'set byte to send 
+              wrbyte    #1,tx_target 'send command #1
+OutputCharWait
+              rdbyte    tx_out,tx_target
+              cmp       tx_out,#0 wc,wz
+        if_nz jmp       #OutputCharWait              
+              ret wz,wc 
+DAT 'OutputLongSub
+OutputLongSub   'Output long in tx_out as hex, setting MSB to make sure non-zero
+              wrlong    tx_out,tx_hexTarget
+              wrbyte    #2,tx_target 'send command #2
+              jmp       #OutputCharWait
+
+DAT 'OutputByteSub
+OutputByteSub   'Output long in tx_out as hex, setting MSB to make sure non-zero
+              wrlong    tx_out,tx_hexTarget
+              wrbyte    #3,tx_target 'send command #3
+              jmp       #OutputCharWait
+
+DAT 'OutputStringSub
+OutputStringSub    'Output a string at provided HUB location
+              wrlong    tx_out,tx_hexTarget
+              wrbyte    #4,tx_target 'send command #4
+              jmp       #OutputCharWait
+
+DAT 'wait 1 sec
+Wait1SecSub    'wait one second
+              GETCT   tx_cnt               'get initial CNT
+              ADDCT1  tx_cnt,##80_000_000          'make initial CT1 target
+              WAITCT1                 'wait for CT1 target
+              ret
+
+DAT 'Messages
+              orgh Messages
+StartMessage  byte      13,13,13,13,"Starting HyperRam Test.",13,0
+ResetMessage  byte      13,"HyperRam Reset Complete.",13,0            
+                          
+
+
+CON  'Serial pin definites and mailboxes
+
+        RX_PIN = 63
+        TX_PIN = 62
+        'Mailbox for serial commands (right before BmpAddressBackground)
+        Mailbox1=$7F80 
+        Mailbox2=$7F81 
+CON  'Serial setting
+  
+        nco_baud =round(float(_CLOCKFREQ) / 115_200.0 * 65536.0) & $fffffc00 | 7  'adapted from garryj's V19 USB code 
+  
+CON  ''Start of serial output code - This is serial output code adapted from code posted by mindrobots in the P2 forum 
+dat     ''Start of serial output code
+
+        org     0
+SerialStart           
+                wrpin pm_tx,  #TX_PIN      'set asynchronous tx mode in smart pin 
+                wxpin ##nco_baud, #TX_PIN      'set tx bit period
+                wrpin pm_rx,  #RX_PIN      'set asynchronous rx mode in smart pin 
+                wxpin ## nco_baud, #RX_PIN      'set rx bit period
+                dirh #TX_PIN    'enable smartpin tx
+                dirh #RX_PIN    'enable smartpin rx
+                jmp     #loopback
+
+'for V27 had to make these two vars into registers
+pm_tx   long  %0000_0000_00_0_0000000000000_01_11110_0        'async tx byte mode, dir high
+pm_rx   long  %0111_0000_00_0_0000000000000_01_11111_0        'async rx byte mode, dir low, inputs pin 0                                       '
+
+'Main loop start
+loopback
+                
+                'Look for command
+                rdbyte  tx_cmd, rx_target                
+                cmp     tx_cmd,#0 wcz
+        if_e    jmp     #loopback
+
+                'check for write byte command
+                cmp     tx_cmd,#1 wcz
+        if_e    rdbyte  tx_char,hex_target        
+        if_e    call    #send_char
+
+                'check for write hex long
+                cmp     tx_cmd,#2 wcz
+        if_e    rdlong  tx_hex, hex_target               
+        if_e    call    #send_LongHexSub
+                
+
+                'check for write hex byte
+                cmp     tx_cmd,#3 wcz
+        if_e    rdbyte  tx_hex, hex_target               
+        if_e    call    #send_ByteHexSub
+
+                'check for write string byte
+                cmp     tx_cmd,#4 wcz
+        if_e    rdlong  tx_hex, hex_target               
+        if_e    call    #send_StringSub    
+        
+     
+
+                wrbyte  #0,rx_target 'message received and processed
+                jmp     #loopback
+
+
+Send_StringSub 'send a string
+                rdbyte  tx_char,tx_hex
+                cmp     tx_char,#0 wcz
+        if_z    ret
+                
+                call    #send_char
+                add     tx_hex,#1
+                jmp     #Send_StringSub
+                                
+                
+Send_LongHexSub  'Send 8 hex chars
+                getnib  tx_temp,tx_hex,#7
+                call    #SendHexSub
+                getnib  tx_temp,tx_hex,#6
+                call    #SendHexSub
+                getnib  tx_temp,tx_hex,#5
+                call    #SendHexSub
+                getnib  tx_temp,tx_hex,#4
+                call    #SendHexSub
+                getnib  tx_temp,tx_hex,#3
+                call    #SendHexSub
+                getnib  tx_temp,tx_hex,#2               
+                call    #SendHexSub
+                getnib  tx_temp,tx_hex,#1
+                call    #SendHexSub
+                getnib  tx_temp,tx_hex,#0
+                call    #SendHexSub
+                ret
+
+Send_ByteHexSub
+                push    tx_hex
+                mov     tx_temp,tx_hex
+                shr     tx_temp,#4
+                and     tx_temp,#$0F
+                call    #SendHexSub
+                pop     tx_hex
+                mov     tx_temp,tx_hex
+                and     tx_temp,#$0F
+                call    #SendHexSub
+                ret
+                                               
+SendHexSub 'Send hex
+                mov     tx_char,tx_temp
+
+                cmp     tx_char,#9 wcz
+        if_a    add     tx_char,#"A"-10
+        if_be   add     tx_char,#"0"
+                call    #Send_Char
+                ret 
+
+
+'*******************************************************************************
+' Get one character from the input port.
+'*******************************************************************************
+
+rcv_char                  
+
+              testb   inb,#RX_PIN     wc      'sample rx
+          if_nc jmp     #rcv_char
+              akpin     #RX_PIN
+              rdpin     rx_char,#RX_PIN
+              ret
+
+
+'*******************************************************************************
+' Output a single character to the tx_pin.         
+'*******************************************************************************
+                           
+send_char       rdpin temp,#tx_pin wc                   'wait if busy
+        if_c    jmp     #send_char
+                wypin tx_char,#tx_pin
+                ret wcz
+
+
+rx_target       long    Mailbox1
+hex_target      long    Mailbox2
+nClocks         long    100*10'5'0
+tx_cmd          res     1
+tx_char         res     1
+tx_hex          res     1
+timer           res     1
+rx_char         res     1
+tx_temp         res     1
+temp            res     1             
+                fit     $1F0
+
+
+'!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+DAT 'HyperBuffer byte buffer for reading
+orgh
+HyperBuffer     long    $F0A05010[644/4]
+'HyperFlag       long    0
+
+DAT 'VGA_Driver   'vsync and hsync normally low
+orgh
+org 0        
+VGA_Driver
+        'drvl    #Pin_Flag
+            waitx   ##50000000
+            rdfast  #0,##$8000-$400     'load .bmp palette into lut
+            rep @.end,#$100
+            rflong  y
+            shl y,#8
+            wrlut   y,x
+            add x,#1
+.end
+
+            wrlut   ##$FF00,#255
+
+            rdfast  ##640*480/64,##BitmapData    'set rdfast to wrap on bitmap
+
+            setxfrq ##round(fset)       'set transfer frequency to 25MHz
+
+        'the next 4 lines may be commented out to bypass level scaling
+
+            setcy   ##intensity << 24   'r  set colorspace for rgb
+            setci   ##intensity << 16   'g
+            setcq   ##intensity << 08   'b
+            setcmod #%01_0_000_0        'enable colorspace conversion
+
+        'RJA dacmodes changed for real P2
+            wrpin   dacmode_s,#0      'enable dac modes in pins 0..3
+            wrpin   dacmode_c,#1
+            wrpin   dacmode_c,#2
+            wrpin   dacmode_c,#3
+            setnib  dira,#$f,#0 'RJA:  New for real P2    
+        
+            
+'
+'
+' Field loop
+'
+field       mov x,#33           'top blanks
+            cogatn     #(1<<HyperRam_Cog)  'preload the top line
+            call    #blank
+
+            mov     x,#480          'set visible lines
+line      
+            call    #hsync          'do horizontal sync
+            cogatn     #(1<<HyperRam_Cog)  'load next line at start of h
+            xcont   m_rf,#0         'visible line
+            djnz    x,#line             'another line?
+
+            mov x,#10           'bottom blanks
+            call    #blank
+            drvnot  #vsync          'sync on
+            mov x,#2            'sync blanks
+            call    #blank
+            drvnot  #vsync          'sync off
+            jmp     #field                  'loop
+'
+'
+' Subroutines
+'
+blank       call    #hsync          'blank lines
+            xcont   m_vi,#0
+    _ret_   djnz    x,#blank
+
+hsync                 
+            rdfast  ##1<<31,##@HyperBuffer  'needs to be here for proper timing            
+            xcont   m_bs,#0         'horizontal sync            
+            xcont   m_sn,#1            
+    _ret_   xcont   m_bv,#0
+'
+'
+' Initialized data
+'RJA:  New dacmodes for real P2
+dacmode_s   long    %0000_0000_000_1011000000000_01_00000_0         'hsync is 123-ohm, 3.3V
+dacmode_c   long    %0000_0000_000_1011100000000_01_00000_0         'R/G/B are 75-ohm, 2.0V
+
+m_bs        long    $7F010000+16        'before sync
+m_sn        long    $7F010000+96        'sync
+m_bv        long    $7F010000+48        'before visible
+m_vi        long    $7F010000+640       'visible
+
+m_rf        long    $7F080000+640       'visible rlong 8bpp lut
+
+x           res 1
+y           res 1
+
+'
+'
+' Bitmap
+'
+        orgh    BitmapData - $436    'justify pixels at BitmapData, pallete at $1000-$400
+        file      "bitmap2.bmp"'"bitmap2.bmp"'combined1.bmp" "TestPat1.bmp"'
+        'bitmap2.bmp   '640 x 480, 8pbb-lut
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

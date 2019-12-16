@@ -1,0 +1,171 @@
+'**********************
+'*  NTSC Spiral Demo  *
+'**********************
+' Reference : http://forums.parallax.com/discussion/170799/ntsc-spiral-demo-now-with-hdmi-and-vga-output
+
+
+DAT		org
+
+        	hubset  ##%1_000001_0000011000_1111_10_00       'config PLL, 20MHz/2*25*1 = 250MHz
+                waitx   ##20_000_000 / 200                      'allow crystal+PLL 5ms to stabilize
+                hubset  ##%1_000001_0000011000_1111_10_11       'switch to PLL
+
+		coginit	#1,##@pgm_ntsc	'launch video cog
+		coginit	#0,##@pgm_bmap	'launch bitmap cog
+
+
+'*********************************
+'*  NTSC 256 x 192 x 8bpp rgbi8  *
+'*********************************
+
+CON
+
+  f_color	= 3_579_545.0		'colorburst frequency
+  f_scanline	= f_color / 227.5	'scanline frequency
+  f_pixel	= f_scanline * 400.0	'pixel frequency for 400 pixels per scanline
+
+  f_clock	= 250_000_000.0		'clock frequency
+
+  f_xfr		= f_pixel / f_clock * float($7FFF_FFFF)
+  f_csc		= f_color / f_clock * float($7FFF_FFFF) * 2.0
+
+  s		= 84			'scale DAC output (s = 0..128)
+  r		= s * 1000 / 1646	'precompensate for modulator expansion of 1.646
+
+  mody		= ((+38*s/128) & $FF) << 24 + ((+75*s/128) & $FF) << 16 + ((+15*s/128) & $FF) << 8 + (110*s/128 & $FF)
+  modi		= ((+76*r/128) & $FF) << 24 + ((-35*r/128) & $FF) << 16 + ((-41*r/128) & $FF) << 8 + (100*s/128 & $FF)
+  modq		= ((+27*r/128) & $FF) << 24 + ((-67*r/128) & $FF) << 16 + ((+40*r/128) & $FF) << 8 + 128
+
+  video_pin	= 16
+
+  ntsc_map	= $1000
+
+DAT		org
+
+' Setup
+
+pgm_ntsc	rdfast	##256*192/64,##ntsc_map	'set rdfast to wrap on bitmap
+
+		setxfrq ##round(f_xfr)		'set transfer frequency
+		setcfrq	##round(f_csc)		'set colorspace converter frequency
+
+		setcy	##mody			'set colorspace converter coefficients
+		setci	##modi
+		setcq	##modq
+
+		setcmod	#%11_1_0000		'set colorspace converter to YIQ mode (composite)
+
+		cogid	.x			'enable dac mode in pin
+		setnib	.dacmode,.x,#2
+		wrpin	.dacmode,#video_pin
+		drvl	#video_pin
+
+' Field loop
+
+.field          mov	.x,#35			'top blanks
+		call	#.blank
+
+                mov     .x,#192			'set visible lines
+.line	        call	#.hsync			'do horizontal sync
+		xcont	.m_rf,#0		'visible line
+		xcont	.m_av,#1		'after visible spacer
+		djnz    .x,#.line           	'another line?
+
+                mov     .x,#27			'bottom blanks
+		call	#.blank
+
+		mov	.x,#6			'high vertical syncs
+.vlow		xcont	.m_hl,#2
+		xcont	.m_hh,#1
+		djnz	.x,#.vlow
+
+		mov	.x,#6			'low vertical syncs
+.vhigh		xcont	.m_ll,#2
+		xcont	.m_lh,#1
+		djnz	.x,#.vhigh
+
+		mov	.x,#6			'high vertical syncs
+.vlow2		xcont	.m_hl,#2
+		xcont	.m_hh,#1
+		djnz	.x,#.vlow2
+
+                jmp     #.field                 'loop
+
+' Subroutines
+
+.blank		call	#.hsync			'blank lines
+		xcont	.m_vi,#0
+		xcont	.m_av,#1
+	_ret_	djnz	.x,#.blank
+
+.hsync		xcont	.m_sn,#2		'horizontal sync
+		xcont	.m_bc,#1
+		xcont	.m_cb,.c_cb
+	_ret_	xcont	.m_ac,#1
+
+' Data
+
+.dacmode	long	%0000_0000_000_1011100000000_01_00000_0
+
+.m_sn		long	$7F010000+29		'sync
+.m_bc		long	$7F010000+7		'before colorburst
+.m_cb		long	$7F010000+18		'colorburst
+.m_ac		long	$7F010000+40		'after colorburst
+.m_vi		long	$7F010000+256		'visible
+.m_av		long	$7F010000+50		'after visible (400 total)
+
+.m_rf		long	$BF030000+256		'visible rfbyte 8bpp rgbi8
+
+.m_hl		long	$7F010000+15		'vertical sync high low 
+.m_hh		long	$7F010000+185		'vertical sync high high (200 total)
+
+.m_ll		long	$7F010000+171		'vertical sync low low
+.m_lh		long	$7F010000+29		'vertical sync low high (200 total)
+
+.c_cb		long	$507000_01		'colorburst reference color
+
+.x		res	1
+.y		res	1
+
+
+'**************************************
+'*  Make spirals in 256 x 192 bitmap  *
+'**************************************
+
+		org
+
+pgm_bmap	wrfast	##256*192/64,##ntsc_map	'set wrfast to wrap on bitmap
+
+.pixel		mov	.px,.x			'translate (x,y) to (x-256/2,y-192/2)
+		sub	.px,#256/2
+		mov	.py,.y
+		sub	.py,#192/2
+		qvector	.px,.py			'convert (x,y) to polar (rho,theta)
+		getqx	.px
+		getqy	.py
+
+		shr	.py,#32-9		'get 9 MSBs of theta
+		add	.py,.px			'add rho to twist it
+		add	.py,.z			'add z to slowly spin it
+
+		mov	.px,.py			'convert 6 LSBs to 5-bit up/down ramp
+		test	.px,#$20	wc
+	if_c	xor	.px,#$3F
+		and	.px,#$1F
+
+		shr	.py,#1			'apply 3 MSBs to RGB bits
+		and	.py,#$E0
+		or	.px,.py
+
+		wfbyte	.px			'write rgbi8 pixel to bitmap
+
+		incmod	.x,#256-1	wc	'step x
+	if_c	incmod	.y,#192-1	wc	'step y
+	if_c	add	.z,#1			'step z
+		jmp	#.pixel
+
+.x		long	0
+.y		long	0
+.z		res	1
+.px		res	1
+.py		res	1

@@ -1,0 +1,210 @@
+'****************************************
+'*  Reciprocal Counter Demonstration    *
+'*  - inputs frequency on P0            *
+'*  - transmits serial text on P62      *
+'****************************************
+'
+' Reference : http://forums.parallax.com/discussion/170882/reciprocal-counter-demo
+'
+
+con		sysfreq		= 250_000_000.0		'system frequency
+		msr_us		= 10_000.0		'minimum measurement time in microseconds (float)
+		msr_pin		= 0			'pin to measure frequency on, uses next two pins
+		baud		= 1_000_000.0		'serial baud rate on P62 (float)
+
+		msr_min		= sysfreq/1e6*msr_us	'minimum measurement time in system clocks
+		msr_pins	= 2<<6 + msr_pin	'group of three pins starting at msr_pin
+
+dat		org
+'
+'
+' Setup
+'
+		hubset	##%1_000001_0000011000_1111_10_00	'enable 20MHz crystal and PLL
+		waitx	##20_000_000/100			'wait 10ms for crystal and PLL to stabilize
+		hubset	##%1_000001_0000011000_1111_10_11	'switch to PLL
+
+		wrpin	msr_time,#msr_pin+0		'configure smart pin for clocks count
+		wrpin	msr_states,#msr_pin+1		'configure smart pin for states count
+		wrpin	msr_periods,#msr_pin+2		'configure smart pin for periods count
+		wxpin	##round(msr_min),#msr_pins	'set smart pins' x-value to clocks in msr_us
+		wypin	#%00,#msr_pins			'set smart pins' y-value to rise-to-rise
+		dirh	#msr_pins			'concurrently enable smart pins
+
+		wrpin	#%01_11110_0,#62		'configure async serial output
+		wxpin	tx_mode,#62
+		dirh	#62
+'
+'
+' Take measurements
+'
+.loop		akpin	#msr_pins			'clear any old measurement
+		waitx	#3
+
+.wait		testp	#msr_pin	wc		'wait for new measurement
+	if_nc	jmp	#.wait
+
+		rqpin	clocks,#msr_pin+0		'get clocks
+		rqpin	states,#msr_pin+1		'get states
+		rqpin	periods,#msr_pin+2		'get periods
+'
+'
+' Compute duty and frequency
+'
+		qmul	states,##1_000			'duty = states * 1_000 / clocks
+		getqx	x
+		getqy	y
+		setq	y
+		qdiv	x,clocks
+		getqx	duty
+
+		qmul	periods,##round(sysfreq)	'frequency = periods * sysfreq / clocks
+		getqx	x
+		getqy	y
+		setq	y
+		qdiv	x,clocks
+		getqx	frequency
+
+		getqy	y				'frequency_sub = remainder / clocks * 1_000_000
+		qfrac	y,clocks
+		getqx	x
+		qmul	x,##1_000_000
+		getqy	frequency_sub
+'
+'
+' Send results serially on P62
+'
+		call	#tx_string			'clocks
+		byte	13," clocks:",0
+		callpa	clocks,#tx_decimal
+
+		call	#tx_string			'states
+		byte	"    states:",0
+		callpa	states,#tx_decimal
+
+		call	#tx_string			'periods
+		byte	"    periods:",0
+		callpa	periods,#tx_decimal
+
+		call	#tx_string			'duty
+		byte	"    duty:",0
+		mov	decx,dec4
+		callpa	duty,#tx_decimal
+		mov	decx,dec10
+
+		call	#tx_string			'frequency
+		byte	"/k    frequency:",0
+		callpa	frequency,#tx_decimal
+		callpa	#".",#tx_chr
+		callpa	frequency_sub,#tx_decimal_sub
+		jmp	#.loop
+'
+'
+' Transmit zero-terminated string following call
+'
+tx_string	pop	x				'pop return address and make byte ptr
+		shl	x,#2
+
+.loop		altgb	x				'get character
+		getbyte	y
+		tjz	y,#.done			'if 0, done
+		callpa	y,#tx_chr			'else, output character
+		ijnz	x,#.loop			'inc byte ptr and loop
+
+.done		shr	x,#2				'make long ptr
+		add	x,#1				'inc long ptr to instruction following string
+		jmp	x				'return to caller
+'
+'
+' Transmit decimal value via callpa
+'
+tx_decimal	mov	x,pa				'decimal value
+
+		mov	v,#2				'init comma tracker
+		mov	w,#0				'init leading-zero flag
+		mov	z,decx				'init tens place
+
+.digit		qdiv	x,z				'divide x by tens place
+		getqx	y
+
+		cmpr	z,#1		wc		'output digit if last or not leading-zero
+		or	w,y		wz
+  if_nc_or_nz	callpa	y,#tx_digit
+  if_c_and_z	callpa	#" ",#tx_chr			'else, output leading space
+
+  if_c		incmod	v,#2		wc		'output commas or leading spaces as needed
+  if_c_and_nz	callpa	#",",#tx_chr
+  if_c_and_z	callpa	#" ",#tx_chr
+
+		qmul	y,z				'subtract tens place digit
+		getqx	y
+		sub	x,y
+
+		qdiv	z,#10				'divide tens place by 10
+		getqx	z
+
+	_ret_	tjnz	z,#.digit			'if not zero, another digit
+
+
+decx		long	1_000_000_000
+dec10		long	1_000_000_000
+dec4		long	1_000
+'
+'
+' Transmit decimal sub value via callpa
+'
+tx_decimal_sub	mov	x,pa				'decimal value
+
+		mov	z,dec6				'init tens place
+
+.digit		qdiv	x,z				'divide x by tens place
+		getqx	y
+
+		callpa	y,#tx_digit			'output digit
+
+		qmul	y,z				'subtract tens place digit
+		getqx	y
+		sub	x,y
+
+		qdiv	z,#10				'divide tens place by 10
+		getqx	z
+
+	_ret_	tjnz	z,#.digit			'if not zero, another digit
+
+
+dec6		long	100_000
+'
+'
+' Transmit digit/character via callpa
+'
+tx_digit	or	pa,#"0"				'turn 0..9 into "0".."9"
+
+tx_chr		rdpin	pb,#62		wc		'wait for pin not busy
+	if_c	jmp	#tx_chr
+
+		wypin	pa,#62				'transmit character
+
+		ret			wcz		'return and preserve caller's flags
+'
+'
+' Data
+'
+tx_mode		long	(round(sysfreq / baud * 65536.0) & $FFFFFC00) + 7	'8N1
+
+msr_time	long	%0000_0000_000_0000_000000000_00_10101_0	'msr_pin+0 config
+msr_states	long	%0111_0111_000_0000_000000000_00_10110_0	'msr_pin+1 config
+msr_periods	long	%0110_0110_000_0000_000000000_00_10111_0	'msr_pin+2 config
+
+clocks		res	1
+states		res	1
+periods		res	1
+
+duty		res	1
+frequency	res	1
+frequency_sub	res	1
+
+v		res	1
+w		res	1
+x		res	1
+y		res	1
+z		res	1
